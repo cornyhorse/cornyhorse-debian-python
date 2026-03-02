@@ -1,0 +1,127 @@
+name: Nightly Build
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/python-base
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect latest CPython 3.14.x release
+        id: detect
+        run: |
+          set -euo pipefail
+          LATEST=$(curl -sL https://www.python.org/ftp/python/ \
+            | grep -oP '3\.14\.\d+' \
+            | sort -t. -k3 -n \
+            | tail -1)
+          echo "version=${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "Latest CPython 3.14.x: ${LATEST}"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if version is already published
+        id: check
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.detect.outputs.version }}"
+          if docker manifest inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}" > /dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${VERSION} already published"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "Version ${VERSION} not yet published"
+          fi
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch — building regardless"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Push to main — building"
+          elif [[ "${{ steps.check.outputs.published }}" == "true" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Version already published — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "New version detected — building"
+          fi
+
+      - name: Checkout
+        if: steps.decide.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        if: steps.decide.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        if: steps.decide.outputs.skip != 'true'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          # Add linux/arm64 here when ready for multi-arch
+          build-args: |
+            PYTHON_VERSION=${{ steps.detect.outputs.version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:3.14
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.detect.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.title=python-base
+            org.opencontainers.image.description=PGO+LTO optimized CPython 3.14 on Debian Bookworm
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.detect.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Post summary
+        if: steps.decide.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Python Base Image Build
+
+          | Key | Value |
+          |-----|-------|
+          | Python version | \`${{ steps.detect.outputs.version }}\` |
+          | Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.detect.outputs.version }}\` |
+          | Digest | \`${{ steps.build.outputs.digest }}\` |
+          | Trigger | \`${{ github.event_name }}\` |
+          EOF
+
+      - name: Post skip summary
+        if: steps.decide.outputs.skip == 'true'
+        run: |
+          set -euo pipefail
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Python Base Image — Build Skipped
+
+          Version \`${{ steps.detect.outputs.version }}\` is already published. No build needed.
+          EOF
