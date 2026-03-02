@@ -17,7 +17,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     libgdbm-dev \
     liblzma-dev \
-    libmpdec-dev \
     libncurses-dev \
     libreadline-dev \
     libsqlite3-dev \
@@ -41,7 +40,6 @@ RUN ./configure \
     --with-computed-gotos \
     --with-system-expat \
     --with-system-ffi \
-    --with-system-libmpdec \
     --enable-loadable-sqlite-extensions
 
 # Build (PGO instrumentation + training + final build) and install
@@ -80,7 +78,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi8 \
     libgdbm6 \
     liblzma5 \
-    libmpdec3 \
     libncurses6 \
     libncursesw6 \
     libreadline8 \
