@@ -43,7 +43,10 @@ RUN ./configure \
     --enable-loadable-sqlite-extensions
 
 # Build (PGO instrumentation + training + final build) and install
-RUN make -j"$(nproc)" && make install
+# PROFILE_TASK skips tests that fail in minimal container environments during PGO profiling
+RUN make -j"$(nproc)" \
+      PROFILE_TASK="-m test --pgo -x test_xml_etree -x test_xml_etree_c" \
+  && make install
 
 # Install pip, setuptools, wheel
 RUN /opt/python/bin/python3 -m ensurepip --upgrade \
@@ -66,7 +69,7 @@ ARG DEBIAN_VERSION=bookworm
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
 
 LABEL org.opencontainers.image.title="python-base" \
-      org.opencontainers.image.description="PGO+LTO optimized CPython 3.14 on Debian Bookworm" \
+      org.opencontainers.image.description="PGO+LTO optimized CPython on Debian Bookworm" \
       org.opencontainers.image.source="https://github.com/cornyhorse/cornyhorse-debian-python" \
       org.opencontainers.image.licenses="MIT"
 

@@ -1,11 +1,20 @@
-name: Nightly Build
+name: Scheduled Build
 
 on:
   schedule:
-    - cron: '0 4 * * *'
+    - cron: '0 4 * * 0'   # Weekly — Sunday 4 AM UTC (amd64 only)
+    - cron: '0 4 1 * *'   # Monthly — 1st of month 4 AM UTC (amd64 + arm64)
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platforms to build'
+        type: choice
+        default: 'linux/amd64'
+        options:
+          - 'linux/amd64'
+          - 'linux/amd64,linux/arm64'
 
 env:
   REGISTRY: ghcr.io
@@ -16,19 +25,28 @@ permissions:
   packages: write
 
 jobs:
-  build:
+  detect:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      platforms: ${{ steps.platforms.outputs.platforms }}
     steps:
-      - name: Detect latest CPython 3.14.x release
-        id: detect
+      - name: Determine platforms
+        id: platforms
         run: |
           set -euo pipefail
-          LATEST=$(curl -sL https://www.python.org/ftp/python/ \
-            | grep -oP '3\.14\.\d+' \
-            | sort -t. -k3 -n \
-            | tail -1)
-          echo "version=${LATEST}" >> "$GITHUB_OUTPUT"
-          echo "Latest CPython 3.14.x: ${LATEST}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "platforms=${{ inputs.platforms }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+          elif [[ "$(date +%d)" == "01" ]]; then
+            # Monthly run (1st of month) — include arm64
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+          else
+            # Weekly run — amd64 only
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Building for: $(cat "$GITHUB_OUTPUT" | grep platforms | cut -d= -f2)"
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -37,91 +55,122 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check if version is already published
-        id: check
+      - name: Detect latest CPython versions and build matrix
+        id: matrix
         run: |
           set -euo pipefail
-          VERSION="${{ steps.detect.outputs.version }}"
-          if docker manifest inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}" > /dev/null 2>&1; then
-            echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "Version ${VERSION} already published"
+
+          FTP_INDEX=$(curl -sL https://www.python.org/ftp/python/)
+
+          build_matrix='{"include":['
+          first=true
+
+          for MINOR in 3.12 3.13 3.14; do
+            LATEST=$(echo "$FTP_INDEX" \
+              | grep -oP "${MINOR//./\\.}\.\d+" \
+              | sort -t. -k3 -n \
+              | tail -1)
+
+            if [[ -z "$LATEST" ]]; then
+              echo "WARNING: No release found for ${MINOR}.x — skipping"
+              continue
+            fi
+
+            # Check if already published (skip if so, unless manual/push)
+            SKIP="false"
+            if [[ "${{ github.event_name }}" == "schedule" ]]; then
+              if docker manifest inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${LATEST}" > /dev/null 2>&1; then
+                echo "Version ${LATEST} already published — skipping"
+                SKIP="true"
+              fi
+            fi
+
+            if [[ "$SKIP" == "false" ]]; then
+              [[ "$first" == "true" ]] && first=false || build_matrix+=','
+              build_matrix+="{\"minor\":\"${MINOR}\",\"version\":\"${LATEST}\"}"
+            fi
+          done
+
+          build_matrix+=']}'
+
+          # Check if matrix is empty
+          COUNT=$(echo "$build_matrix" | jq '.include | length')
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "No versions to build"
+            echo "matrix=" >> "$GITHUB_OUTPUT"
           else
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            echo "Version ${VERSION} not yet published"
+            echo "matrix=${build_matrix}" >> "$GITHUB_OUTPUT"
+            echo "Building: ${build_matrix}"
           fi
 
-      - name: Decide whether to build
-        id: decide
-        run: |
-          set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "Manual dispatch — building regardless"
-          elif [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "Push to main — building"
-          elif [[ "${{ steps.check.outputs.published }}" == "true" ]]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Version already published — skipping"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "New version detected — building"
-          fi
-
+  build:
+    needs: detect
+    if: needs.detect.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+    steps:
       - name: Checkout
-        if: steps.decide.outputs.skip != 'true'
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        if: contains(needs.detect.outputs.platforms, 'arm64')
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
-        if: steps.decide.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v3
 
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine tags
+        id: tags
+        run: |
+          set -euo pipefail
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.minor }}"
+          TAGS="${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.version }}"
+          # Only tag :latest for the highest minor version (3.14)
+          if [[ "${{ matrix.minor }}" == "3.14" ]]; then
+            TAGS="${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
-        if: steps.decide.outputs.skip != 'true'
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          platforms: linux/amd64
-          # Add linux/arm64 here when ready for multi-arch
+          platforms: ${{ needs.detect.outputs.platforms }}
           build-args: |
-            PYTHON_VERSION=${{ steps.detect.outputs.version }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:3.14
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.detect.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            PYTHON_VERSION=${{ matrix.version }}
+          tags: ${{ steps.tags.outputs.tags }}
           labels: |
             org.opencontainers.image.title=python-base
-            org.opencontainers.image.description=PGO+LTO optimized CPython 3.14 on Debian Bookworm
+            org.opencontainers.image.description=PGO+LTO optimized CPython ${{ matrix.minor }} on Debian Bookworm
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.detect.outputs.version }}
+            org.opencontainers.image.version=${{ matrix.version }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=MIT
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=python-${{ matrix.minor }}
+          cache-to: type=gha,mode=max,scope=python-${{ matrix.minor }}
 
       - name: Post summary
-        if: steps.decide.outputs.skip != 'true'
         run: |
           set -euo pipefail
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## Python Base Image Build
+          ## Python Base Image Build — ${{ matrix.minor }}
 
           | Key | Value |
           |-----|-------|
-          | Python version | \`${{ steps.detect.outputs.version }}\` |
-          | Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.detect.outputs.version }}\` |
+          | Python version | \`${{ matrix.version }}\` |
+          | Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.version }}\` |
+          | Platforms | \`${{ needs.detect.outputs.platforms }}\` |
           | Digest | \`${{ steps.build.outputs.digest }}\` |
           | Trigger | \`${{ github.event_name }}\` |
-          EOF
-
-      - name: Post skip summary
-        if: steps.decide.outputs.skip == 'true'
-        run: |
-          set -euo pipefail
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## Python Base Image — Build Skipped
-
-          Version \`${{ steps.detect.outputs.version }}\` is already published. No build needed.
           EOF

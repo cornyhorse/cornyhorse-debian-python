@@ -1,16 +1,21 @@
 # python-base
 
-PGO + LTO optimized **CPython 3.14** Docker base image built on **Debian Bookworm (slim)**.
+PGO + LTO optimized **CPython** Docker base images built on **Debian Bookworm (slim)**.
 
-Published to GitHub Container Registry and consumed by the [trombbone](https://github.com/cornyhorse/trombbone) project.
+Published to GitHub Container Registry for **linux/amd64** and **linux/arm64**.
+Consumed by the [trombbone](https://github.com/cornyhorse/trombbone) project.
+
+## Available versions
+
+| Python | Pull command |
+|--------|--------------|
+| 3.14 | `docker pull ghcr.io/cornyhorse/python-base:3.14` |
+| 3.13 | `docker pull ghcr.io/cornyhorse/python-base:3.13` |
+| 3.12 | `docker pull ghcr.io/cornyhorse/python-base:3.12` |
+
+The `:latest` tag always points to the latest **3.14** build.
 
 ## Quick start
-
-```bash
-docker pull ghcr.io/cornyhorse/python-base:3.14
-```
-
-Use it in a Dockerfile:
 
 ```dockerfile
 FROM ghcr.io/cornyhorse/python-base:3.14
@@ -25,6 +30,7 @@ CMD ["python3", "main.py"]
 ## What's included
 
 - CPython compiled from source with `--enable-optimizations` (PGO), `--with-lto`, and `--with-computed-gotos`
+- Multi-arch: `linux/amd64` and `linux/arm64`
 - Python installed to `/opt/python` with `/opt/python/bin` on `PATH`
 - pip, setuptools, and wheel pre-installed
 - Environment variables: `PYTHONUNBUFFERED=1`, `PYTHONDONTWRITEBYTECODE=1`, `LANG=C.UTF-8`
@@ -35,8 +41,14 @@ CMD ["python3", "main.py"]
 | Tag | Description |
 |-----|-------------|
 | `3.14` | Latest 3.14.x build (rolling) |
+| `3.13` | Latest 3.13.x build (rolling) |
+| `3.12` | Latest 3.12.x build (rolling) |
 | `3.14.x` | Specific patch version (e.g., `3.14.2`) |
+| `3.13.x` | Specific patch version (e.g., `3.13.3`) |
+| `3.12.x` | Specific patch version (e.g., `3.12.9`) |
 | `latest` | Alias for `3.14` |
+
+All tags are multi-arch manifests covering `linux/amd64` and `linux/arm64`.
 
 ## Build args
 
@@ -47,9 +59,11 @@ CMD ["python3", "main.py"]
 
 ## Automated builds
 
-- **Nightly** (4:00 AM UTC): Checks [python.org/ftp](https://www.python.org/ftp/python/) for new CPython 3.14.x releases. Builds and pushes only when a new patch version is detected. Can also be triggered manually via `workflow_dispatch`.
-- **Release**: Push a tag like `v3.14.2` to trigger a build for that specific version.
-- **Push to main**: Any push to `main` triggers a build with the latest detected version.
+- **Weekly** (Sunday 4:00 AM UTC): Checks [python.org/ftp](https://www.python.org/ftp/python/) for new CPython 3.12.x, 3.13.x, and 3.14.x releases. Builds `linux/amd64` only. Skips versions already published.
+- **Monthly** (1st of month, 4:00 AM UTC): Same detection, but builds both `linux/amd64` and `linux/arm64`.
+- **Release**: Push a tag like `v3.14.2`, `v3.13.3`, or `v3.12.9` to trigger a multi-arch build for that specific version.
+- **Push to main**: Any push to `main` triggers an amd64 build for all three version series.
+- **Manual dispatch**: Trigger from Actions tab with a choice of `linux/amd64` or `linux/amd64,linux/arm64`.
 
 ## Package visibility
 
