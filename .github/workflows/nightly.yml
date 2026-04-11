@@ -16,12 +16,18 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: scheduled-build-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       platforms: ${{ steps.platforms.outputs.platforms }}
+      push_minor: ${{ steps.matrix.outputs.push_minor }}
+      push_version: ${{ steps.matrix.outputs.push_version }}
     steps:
       - name: Determine platforms
         id: platforms
@@ -45,6 +51,8 @@ jobs:
 
           FTP_INDEX=$(curl -sL https://www.python.org/ftp/python/)
           PUSH_MINOR="3.14"
+          echo "push_minor=" >> "$GITHUB_OUTPUT"
+          echo "push_version=" >> "$GITHUB_OUTPUT"
 
           build_matrix='{"include":['
           first=true
@@ -95,13 +103,17 @@ jobs:
             echo "No versions to build"
             echo "matrix=" >> "$GITHUB_OUTPUT"
           else
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              echo "push_minor=$(echo "$build_matrix" | jq -r '.include[0].minor')" >> "$GITHUB_OUTPUT"
+              echo "push_version=$(echo "$build_matrix" | jq -r '.include[0].version')" >> "$GITHUB_OUTPUT"
+            fi
             echo "matrix=${build_matrix}" >> "$GITHUB_OUTPUT"
             echo "Building: ${build_matrix}"
           fi
 
   build:
     needs: detect
-    if: needs.detect.outputs.matrix != ''
+    if: github.event_name != 'push' && needs.detect.outputs.matrix != ''
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
@@ -144,6 +156,7 @@ jobs:
           context: .
           push: true
           platforms: ${{ needs.detect.outputs.platforms }}
+          provenance: false
           build-args: |
             PYTHON_VERSION=${{ matrix.version }}
           tags: ${{ steps.tags.outputs.tags }}
@@ -169,5 +182,142 @@ jobs:
           | Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.version }}\` |
           | Platforms | \`${{ needs.detect.outputs.platforms }}\` |
           | Digest | \`${{ steps.build.outputs.digest }}\` |
+          | Trigger | \`${{ github.event_name }}\` |
+          EOF
+
+  build_push_amd64:
+    needs: detect
+    if: github.event_name == 'push' && needs.detect.outputs.push_version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build amd64 image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          provenance: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},name-canonical=true,push-by-digest=true,push=true
+          build-args: |
+            PYTHON_VERSION=${{ needs.detect.outputs.push_version }}
+          labels: |
+            org.opencontainers.image.title=python-base
+            org.opencontainers.image.description=PGO+LTO optimized CPython ${{ needs.detect.outputs.push_minor }} on Debian Bookworm
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.detect.outputs.push_version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha,scope=python-${{ needs.detect.outputs.push_minor }}-amd64
+          cache-to: type=gha,mode=max,scope=python-${{ needs.detect.outputs.push_minor }}-amd64
+
+  build_push_arm64:
+    needs: detect
+    if: github.event_name == 'push' && needs.detect.outputs.push_version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build arm64 image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          provenance: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},name-canonical=true,push-by-digest=true,push=true
+          build-args: |
+            PYTHON_VERSION=${{ needs.detect.outputs.push_version }}
+          labels: |
+            org.opencontainers.image.title=python-base
+            org.opencontainers.image.description=PGO+LTO optimized CPython ${{ needs.detect.outputs.push_minor }} on Debian Bookworm
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.detect.outputs.push_version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha,scope=python-${{ needs.detect.outputs.push_minor }}-arm64
+          cache-to: type=gha,mode=max,scope=python-${{ needs.detect.outputs.push_minor }}-arm64
+
+  merge_push_manifest:
+    needs: [detect, build_push_amd64, build_push_arm64]
+    if: github.event_name == 'push' && needs.detect.outputs.push_version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish multi-arch manifest
+        run: |
+          set -euo pipefail
+          cmd=(
+            docker buildx imagetools create
+            --tag "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.detect.outputs.push_minor }}"
+            --tag "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.detect.outputs.push_version }}"
+          )
+
+          if [[ "${{ needs.detect.outputs.push_minor }}" == "3.14" ]]; then
+            cmd+=(--tag "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest")
+          fi
+
+          cmd+=(
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build_push_amd64.outputs.digest }}"
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build_push_arm64.outputs.digest }}"
+          )
+
+          "${cmd[@]}"
+
+      - name: Post summary
+        run: |
+          set -euo pipefail
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Python Base Image Build — ${{ needs.detect.outputs.push_minor }}
+
+          | Key | Value |
+          |-----|-------|
+          | Python version | \`${{ needs.detect.outputs.push_version }}\` |
+          | Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.detect.outputs.push_version }}\` |
+          | Platforms | \`linux/amd64, linux/arm64\` |
+          | amd64 digest | \`${{ needs.build_push_amd64.outputs.digest }}\` |
+          | arm64 digest | \`${{ needs.build_push_arm64.outputs.digest }}\` |
           | Trigger | \`${{ github.event_name }}\` |
           EOF
