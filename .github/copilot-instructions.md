@@ -17,7 +17,7 @@ Dockerfile                     # Two-stage build: builder → runtime
 .dockerignore
 .github/
   workflows/
-    nightly.yml                # Weekly/monthly multi-arch publish + push + manual
+    nightly.yml                # Weekly/monthly full publish + push (3.14) + manual
     release.yml                # Tag-triggered release build (v3.12.*, v3.13.*, v3.14.*)
 README.md
 ```
@@ -40,7 +40,8 @@ README.md
 - **nightly.yml** (misnamed — actually weekly/monthly): runs weekly on Sunday
   at 04:00 UTC and again on the 1st of each month.
   Also on push to `main` and `workflow_dispatch`.
-  Uses a matrix to build 3.12, 3.13, and 3.14 in parallel.
+  Push-triggered runs publish 3.14 only so the most-used tags update first;
+  scheduled/manual runs build 3.12, 3.13, and 3.14.
   Detects the latest CPython patch for each minor from python.org FTP;
   skips versions already published as complete amd64+arm64 manifests on scheduled runs.
 - **release.yml**: triggered by pushing a tag like `v3.14.2`, `v3.13.3`, or `v3.12.9`.

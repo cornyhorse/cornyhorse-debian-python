@@ -44,11 +44,17 @@ jobs:
           set -euo pipefail
 
           FTP_INDEX=$(curl -sL https://www.python.org/ftp/python/)
+          PUSH_MINOR="3.14"
 
           build_matrix='{"include":['
           first=true
 
           for MINOR in 3.12 3.13 3.14; do
+            if [[ "${{ github.event_name }}" == "push" && "$MINOR" != "$PUSH_MINOR" ]]; then
+              echo "Push run prioritizes ${PUSH_MINOR}; skipping ${MINOR}"
+              continue
+            fi
+
             LATEST=$(echo "$FTP_INDEX" \
               | grep -oP "${MINOR//./\\.}\.\d+" \
               | sort -t. -k3 -n \
