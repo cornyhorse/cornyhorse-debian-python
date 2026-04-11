@@ -2,19 +2,11 @@ name: Scheduled Build
 
 on:
   schedule:
-    - cron: '0 4 * * 0'   # Weekly — Sunday 4 AM UTC (amd64 only)
-    - cron: '0 4 1 * *'   # Monthly — 1st of month 4 AM UTC (amd64 + arm64)
+    - cron: '0 4 * * 0'   # Weekly — Sunday 4 AM UTC
+    - cron: '0 4 1 * *'   # Additional monthly run — 1st of month 4 AM UTC
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      platforms:
-        description: 'Platforms to build'
-        type: choice
-        default: 'linux/amd64'
-        options:
-          - 'linux/amd64'
-          - 'linux/amd64,linux/arm64'
 
 env:
   REGISTRY: ghcr.io
@@ -35,21 +27,12 @@ jobs:
         id: platforms
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "platforms=${{ inputs.platforms }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
-          elif [[ "$(date +%d)" == "01" ]]; then
-            # Monthly run (1st of month) — include arm64
-            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
-          else
-            # Weekly run — amd64 only
-            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
-          fi
+          # Shared release tags must always stay multi-arch.
+          echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
           echo "Building for: $(cat "$GITHUB_OUTPUT" | grep platforms | cut -d= -f2)"
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -79,9 +62,16 @@ jobs:
             # Check if already published (skip if so, unless manual/push)
             SKIP="false"
             if [[ "${{ github.event_name }}" == "schedule" ]]; then
-              if docker manifest inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${LATEST}" > /dev/null 2>&1; then
-                echo "Version ${LATEST} already published — skipping"
-                SKIP="true"
+              if MANIFEST_JSON=$(docker manifest inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${LATEST}" 2>/dev/null); then
+                if echo "$MANIFEST_JSON" | jq -e '
+                  any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "amd64") and
+                  any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "arm64")
+                ' > /dev/null; then
+                  echo "Version ${LATEST} already published for amd64 and arm64 — skipping"
+                  SKIP="true"
+                else
+                  echo "Version ${LATEST} is missing one or more target platforms — rebuilding"
+                fi
               fi
             fi
 
@@ -107,23 +97,23 @@ jobs:
     needs: detect
     if: needs.detect.outputs.matrix != ''
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up QEMU
         if: contains(needs.detect.outputs.platforms, 'arm64')
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -143,7 +133,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true

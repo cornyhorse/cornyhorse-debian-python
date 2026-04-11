@@ -59,11 +59,11 @@ All tags are multi-arch manifests covering `linux/amd64` and `linux/arm64`.
 
 ## Automated builds
 
-- **Weekly** (Sunday 4:00 AM UTC): Checks [python.org/ftp](https://www.python.org/ftp/python/) for new CPython 3.12.x, 3.13.x, and 3.14.x releases. Builds `linux/amd64` only. Skips versions already published.
-- **Monthly** (1st of month, 4:00 AM UTC): Same detection, but builds both `linux/amd64` and `linux/arm64`.
+- **Weekly** (Sunday 4:00 AM UTC): Checks [python.org/ftp](https://www.python.org/ftp/python/) for new CPython 3.12.x, 3.13.x, and 3.14.x releases. Publishes multi-arch images for `linux/amd64` and `linux/arm64`. Scheduled runs skip a version only when both platforms are already present.
+- **Monthly** (1st of month, 4:00 AM UTC): An additional scheduled multi-arch publish using the same detection logic.
 - **Release**: Push a tag like `v3.14.2`, `v3.13.3`, or `v3.12.9` to trigger a multi-arch build for that specific version.
-- **Push to main**: Any push to `main` triggers an amd64 build for all three version series.
-- **Manual dispatch**: Trigger from Actions tab with a choice of `linux/amd64` or `linux/amd64,linux/arm64`.
+- **Push to main**: Any push to `main` triggers a multi-arch publish for all three version series.
+- **Manual dispatch**: Trigger from Actions tab to publish the latest detected versions for both `linux/amd64` and `linux/arm64`.
 
 ## Package visibility
 
