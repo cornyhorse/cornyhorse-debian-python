@@ -59,6 +59,8 @@ All tags are multi-arch manifests covering `linux/amd64` and `linux/arm64`.
 
 ## Automated builds
 
+Each architecture is built natively (amd64 on `ubuntu-latest`, arm64 on `ubuntu-24.04-arm`, no QEMU) in its own job and pushed by digest; a merge job then publishes the multi-arch tags.
+
 - **Weekly** (Sunday 4:00 AM UTC): Checks [python.org/ftp](https://www.python.org/ftp/python/) for new CPython 3.12.x, 3.13.x, and 3.14.x releases. Publishes multi-arch images for `linux/amd64` and `linux/arm64`. Scheduled runs skip a version only when both platforms are already present.
 - **Monthly** (1st of month, 4:00 AM UTC): An additional scheduled multi-arch publish using the same detection logic.
 - **Release**: Push a tag like `v3.14.2`, `v3.13.3`, or `v3.12.9` to trigger a multi-arch build for that specific version.
