@@ -49,9 +49,14 @@ RUN make -j"$(nproc)" \
   && make install
 
 # Install pip, setuptools, wheel
+# pip >= 26.2.2 (emSign ECC Root CA - G3 distrust, 2026-10): pip trusts its own vendored
+# certifi, not the OS store. The bundled ensurepip pip is still old, so the first upgrade
+# uses the hash-pinned wheel from the official advisory.
 RUN /opt/python/bin/python3 -m ensurepip --upgrade \
+  && /opt/python/bin/pip3 install --no-cache-dir \
+       "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70" \
   && /opt/python/bin/pip3 install --no-cache-dir --upgrade \
-       pip setuptools wheel
+       "pip>=26.2.2" setuptools wheel
 
 # Reduce image size: strip binaries, remove static libs, tests, caches
 RUN find /opt/python/lib -type d -name 'test' -prune -exec rm -rf {} + 2>/dev/null || true \
@@ -73,8 +78,10 @@ LABEL org.opencontainers.image.title="python-base" \
       org.opencontainers.image.source="https://github.com/cornyhorse/cornyhorse-debian-python" \
       org.opencontainers.image.licenses="MIT"
 
-# Install only runtime shared libraries
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install only runtime shared libraries. Upgrading first (and building with pull) means a rebuild
+# never ships a stale trust store (emSign ECC Root CA - G3 distrust, 2026-10).
+RUN apt-get update && apt-get upgrade -y \
+  && apt-get install -y --no-install-recommends \
     ca-certificates \
     libbz2-1.0 \
     libexpat1 \

@@ -154,6 +154,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          pull: true
           push: true
           platforms: ${{ needs.detect.outputs.platforms }}
           provenance: false
@@ -211,6 +212,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          pull: true
           platforms: linux/amd64
           provenance: false
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},name-canonical=true,push-by-digest=true,push=true
@@ -255,6 +257,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          pull: true
           platforms: linux/arm64
           provenance: false
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},name-canonical=true,push-by-digest=true,push=true
