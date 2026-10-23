@@ -25,18 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
-      platforms: ${{ steps.platforms.outputs.platforms }}
-      push_minor: ${{ steps.matrix.outputs.push_minor }}
-      push_version: ${{ steps.matrix.outputs.push_version }}
+      build_matrix: ${{ steps.matrix.outputs.build_matrix }}
     steps:
-      - name: Determine platforms
-        id: platforms
-        run: |
-          set -euo pipefail
-          # Shared release tags must always stay multi-arch.
-          echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
-          echo "Building for: $(cat "$GITHUB_OUTPUT" | grep platforms | cut -d= -f2)"
-
       - name: Login to GHCR
         uses: docker/login-action@v4
         with:
@@ -51,8 +41,6 @@ jobs:
 
           FTP_INDEX=$(curl -sL https://www.python.org/ftp/python/)
           PUSH_MINOR="3.14"
-          echo "push_minor=" >> "$GITHUB_OUTPUT"
-          echo "push_version=" >> "$GITHUB_OUTPUT"
 
           build_matrix='{"include":['
           first=true
@@ -102,30 +90,28 @@ jobs:
           if [[ "$COUNT" -eq 0 ]]; then
             echo "No versions to build"
             echo "matrix=" >> "$GITHUB_OUTPUT"
+            echo "build_matrix=" >> "$GITHUB_OUTPUT"
           else
-            if [[ "${{ github.event_name }}" == "push" ]]; then
-              echo "push_minor=$(echo "$build_matrix" | jq -r '.include[0].minor')" >> "$GITHUB_OUTPUT"
-              echo "push_version=$(echo "$build_matrix" | jq -r '.include[0].version')" >> "$GITHUB_OUTPUT"
-            fi
+            # One build job per (minor, arch), each on a native runner (no QEMU).
+            per_arch=$(echo "$build_matrix" | jq -c '
+              {include: [.include[] | . as $v | ("amd64", "arm64") as $a
+                | $v + {arch: $a, runner: (if $a == "arm64" then "ubuntu-24.04-arm" else "ubuntu-latest" end)}]}')
             echo "matrix=${build_matrix}" >> "$GITHUB_OUTPUT"
-            echo "Building: ${build_matrix}"
+            echo "build_matrix=${per_arch}" >> "$GITHUB_OUTPUT"
+            echo "Building: ${per_arch}"
           fi
 
   build:
     needs: detect
-    if: github.event_name != 'push' && needs.detect.outputs.matrix != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
+    if: needs.detect.outputs.matrix != ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.detect.outputs.build_matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Set up QEMU
-        if: contains(needs.detect.outputs.platforms, 'arm64')
-        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -137,30 +123,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine tags
-        id: tags
-        run: |
-          set -euo pipefail
-          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.minor }}"
-          TAGS="${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.version }}"
-          # Only tag :latest for the highest minor version (3.14)
-          if [[ "${{ matrix.minor }}" == "3.14" ]]; then
-            TAGS="${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          fi
-          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push
+      - name: Build ${{ matrix.arch }} image
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
+          platforms: linux/${{ matrix.arch }}
           pull: true
-          push: true
-          platforms: ${{ needs.detect.outputs.platforms }}
           provenance: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},name-canonical=true,push-by-digest=true,push=true
           build-args: |
             PYTHON_VERSION=${{ matrix.version }}
-          tags: ${{ steps.tags.outputs.tags }}
           labels: |
             org.opencontainers.image.title=python-base
             org.opencontainers.image.description=PGO+LTO optimized CPython ${{ matrix.minor }} on Debian Bookworm
@@ -168,117 +141,42 @@ jobs:
             org.opencontainers.image.version=${{ matrix.version }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=MIT
-          cache-from: type=gha,scope=python-${{ matrix.minor }}
-          cache-to: type=gha,mode=max,scope=python-${{ matrix.minor }}
+          cache-from: type=gha,scope=python-${{ matrix.minor }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=python-${{ matrix.minor }}-${{ matrix.arch }}
 
-      - name: Post summary
+      - name: Export digest
         run: |
           set -euo pipefail
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## Python Base Image Build — ${{ matrix.minor }}
+          digest="${{ steps.build.outputs.digest }}"
+          mkdir -p "${{ runner.temp }}/digests"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
-          | Key | Value |
-          |-----|-------|
-          | Python version | \`${{ matrix.version }}\` |
-          | Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.version }}\` |
-          | Platforms | \`${{ needs.detect.outputs.platforms }}\` |
-          | Digest | \`${{ steps.build.outputs.digest }}\` |
-          | Trigger | \`${{ github.event_name }}\` |
-          EOF
-
-  build_push_amd64:
-    needs: detect
-    if: github.event_name == 'push' && needs.detect.outputs.push_version != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to GHCR
-        uses: docker/login-action@v4
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          name: digests-${{ matrix.minor }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Build amd64 image
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          pull: true
-          platforms: linux/amd64
-          provenance: false
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},name-canonical=true,push-by-digest=true,push=true
-          build-args: |
-            PYTHON_VERSION=${{ needs.detect.outputs.push_version }}
-          labels: |
-            org.opencontainers.image.title=python-base
-            org.opencontainers.image.description=PGO+LTO optimized CPython ${{ needs.detect.outputs.push_minor }} on Debian Bookworm
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ needs.detect.outputs.push_version }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.licenses=MIT
-          cache-from: type=gha,scope=python-${{ needs.detect.outputs.push_minor }}-amd64
-          cache-to: type=gha,mode=max,scope=python-${{ needs.detect.outputs.push_minor }}-amd64
-
-  build_push_arm64:
-    needs: detect
-    if: github.event_name == 'push' && needs.detect.outputs.push_version != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build arm64 image
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          pull: true
-          platforms: linux/arm64
-          provenance: false
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},name-canonical=true,push-by-digest=true,push=true
-          build-args: |
-            PYTHON_VERSION=${{ needs.detect.outputs.push_version }}
-          labels: |
-            org.opencontainers.image.title=python-base
-            org.opencontainers.image.description=PGO+LTO optimized CPython ${{ needs.detect.outputs.push_minor }} on Debian Bookworm
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ needs.detect.outputs.push_version }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.licenses=MIT
-          cache-from: type=gha,scope=python-${{ needs.detect.outputs.push_minor }}-arm64
-          cache-to: type=gha,mode=max,scope=python-${{ needs.detect.outputs.push_minor }}-arm64
-
-  merge_push_manifest:
-    needs: [detect, build_push_amd64, build_push_arm64]
-    if: github.event_name == 'push' && needs.detect.outputs.push_version != ''
+  merge:
+    needs: [detect, build]
+    # Run per minor even if another minor's build failed; the digest count check below
+    # keeps a minor with a missing platform from being published single-arch.
+    if: ${{ !cancelled() && needs.detect.result == 'success' && needs.detect.outputs.matrix != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
     steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.minor }}-*
+          merge-multiple: true
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -290,22 +188,31 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
         run: |
           set -euo pipefail
-          cmd=(
-            docker buildx imagetools create
-            --tag "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.detect.outputs.push_minor }}"
-            --tag "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.detect.outputs.push_version }}"
-          )
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
 
-          if [[ "${{ needs.detect.outputs.push_minor }}" == "3.14" ]]; then
-            cmd+=(--tag "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest")
+          # Exactly one digest per platform (amd64 + arm64), or publish nothing.
+          if [[ "$(ls | wc -l)" -ne 2 ]]; then
+            echo "::error::Expected 2 digests (amd64, arm64) for ${{ matrix.minor }}, found: $(ls | tr '\n' ' ')"
+            exit 1
           fi
 
-          cmd+=(
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build_push_amd64.outputs.digest }}"
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build_push_arm64.outputs.digest }}"
+          cmd=(
+            docker buildx imagetools create
+            --tag "${IMAGE}:${{ matrix.minor }}"
+            --tag "${IMAGE}:${{ matrix.version }}"
           )
+
+          # Only tag :latest for the highest minor version (3.14)
+          if [[ "${{ matrix.minor }}" == "3.14" ]]; then
+            cmd+=(--tag "${IMAGE}:latest")
+          fi
+
+          for digest in *; do
+            cmd+=("${IMAGE}@sha256:${digest}")
+          done
 
           "${cmd[@]}"
 
@@ -313,14 +220,12 @@ jobs:
         run: |
           set -euo pipefail
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## Python Base Image Build — ${{ needs.detect.outputs.push_minor }}
+          ## Python Base Image Build — ${{ matrix.minor }}
 
           | Key | Value |
           |-----|-------|
-          | Python version | \`${{ needs.detect.outputs.push_version }}\` |
-          | Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.detect.outputs.push_version }}\` |
+          | Python version | \`${{ matrix.version }}\` |
+          | Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.version }}\` |
           | Platforms | \`linux/amd64, linux/arm64\` |
-          | amd64 digest | \`${{ needs.build_push_amd64.outputs.digest }}\` |
-          | arm64 digest | \`${{ needs.build_push_arm64.outputs.digest }}\` |
           | Trigger | \`${{ github.event_name }}\` |
           EOF
