@@ -1,0 +1,228 @@
+name: Scheduled Build
+
+# Gitea Actions port of .github/workflows/nightly.yml (runner: gitea-runner-vm, label ubuntu-latest). Template and reasons:
+# docs/operations/gitea-ci-image-builds.md in the MattsTools repo (kaniko, section 7), as run by cornyhorse/sizer.
+#
+# What differs from the GitHub original:
+#   - The image is built with kaniko (the osscontainertools fork, pinned by digest) in a docker:// step. The runner has no Docker
+#     daemon, so there is no QEMU, buildx or docker/build-push-action, and no layer cache (type=gha has no equivalent).
+#   - amd64 only (decided 2026-10-22). The GitHub workflows build linux/amd64 and linux/arm64 (arm64 on a native GitHub runner)
+#     and join the two with imagetools; the Gitea runner has no arm64, so each tag is a single amd64 image and there is no
+#     merge job. Everything that pulls python-base (hz, hzpub, tbc and the other VMs) is amd64.
+#   - The build holds no credential. Its RUN steps could read one (a RUN step can read the build container's environment), so
+#     the image goes to a tarball and a separate step, the only one that sees the secret, pushes it.
+#   - The push credential is a personal access token of the cornyhorse user (classic, write:packages) in the repo secret
+#     GHCR_PUSH_TOKEN. GitHub's GITHUB_TOKEN plus "Manage Actions access" on the package does not exist on Gitea. While the secret
+#     is empty (it is until Matt creates it) the push step is skipped, so a run only builds.
+#   - The labels docker/build-push-action set are set here (title, source, version, revision, licenses, plus url and created). The
+#     description label is the Dockerfile's own ("PGO+LTO optimized CPython on Debian Bookworm"): kaniko lets a LABEL in the
+#     Dockerfile win over --label, so the minor the GitHub workflow added to it ("CPython 3.14") is not there.
+#   - actions/checkout does not persist its credentials; the Dockerfile copies nothing from the context anyway.
+#   - The Show step reads libbrotli1 out of the image (CVE-2026-111497). python-base installs none (the builder stage has curl,
+#     but it is not shipped, and the runtime stage upgrades its packages); the job fails, before anything is pushed, only if one
+#     ever appears and is older than the fixed Debian bookworm 1.0.9-2+deb12u1.
+#   - A static matrix of the three minors replaces the detect job and its generated matrix: this Gitea does not expand
+#     `matrix: ${{ fromJson(needs.detect.outputs.matrix) }}` (tested 2026-10-25: the job ran once with an empty matrix). Each
+#     matrix job now does the detection itself, in its first step, and the steps after it run only when there is something to
+#     build.
+#   - The "already published" check asks GHCR directly (the package is public, so an anonymous token is enough) instead of
+#     `docker manifest inspect`, and a tag that exists in any form counts as published: every tag made so far has both platforms,
+#     and the new ones have amd64 only.
+#   - Pull requests build 3.14 only (as a push does), and only when the Dockerfile or this workflow changed. They never push.
+#   - A manual run takes an optional list of minors (default all three), so one version can be rebuilt on its own.
+#   - NOT PORTED: the per-architecture digest hand-off (artifacts) and the merge job. There is nothing to merge.
+#
+# The push step runs only on main (a push, the schedule, or a manual run): Gitea has no environment protection, so the `if:`
+# stops mistakes, not a hostile branch (the repo's secrets are only for people who can push to it).
+#
+# While the repo is on both forges, only the GitHub workflows publish: Gitea ignores .github/workflows once .gitea/workflows
+# exists, and GitHub ignores .gitea. When the repo moves, retire .github/workflows/nightly.yml and release.yml in the same change
+# that points the push mirror at GitHub, or the mirrored push would publish a second time.
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'   # Weekly: Sunday 4 AM UTC
+    - cron: '0 4 1 * *'   # Additional monthly run: 1st of month 4 AM UTC
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .gitea/workflows/nightly.yml
+  workflow_dispatch:
+    inputs:
+      minors:
+        description: 'CPython minors to build, space separated'
+        required: false
+        default: '3.12 3.13 3.14'
+
+permissions:
+  contents: read    # the job token reads this repo and cannot push packages anyway
+
+env:
+  IMAGE: ghcr.io/cornyhorse/python-base
+  GHCR_USER: cornyhorse   # the user the token belongs to
+  LIBBROTLI_MIN: 1.0.9-2+deb12u1   # Debian bookworm
+
+concurrency:
+  group: scheduled-build-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: build ${{ matrix.minor }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        minor: ['3.12', '3.13', '3.14']
+    steps:
+      # The latest patch release of this minor, and whether to build it at all.
+      - name: Detect the latest CPython release and whether to build it
+        id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          MINOR: ${{ matrix.minor }}
+          MINORS: ${{ github.event.inputs.minors }}
+        run: |
+          set -euo pipefail
+          PUSH_MINOR="3.14"
+          # An unset input (every event but a manual run) means all three.
+          MINORS="${MINORS:-3.12 3.13 3.14}"
+
+          # Is this tag already on GHCR? The package is public: an anonymous pull token is enough.
+          published() {
+            local token code
+            token=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:cornyhorse/python-base:pull" | jq -r .token) || return 1
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/cornyhorse/python-base/manifests/$1") || return 1
+            [[ "$code" == 200 ]]
+          }
+
+          build=false
+          version=""
+          if [[ " $MINORS " != *" $MINOR "* ]]; then
+            echo "$MINOR is not in the requested minors ($MINORS), nothing to do"
+          elif [[ "$EVENT" == push || "$EVENT" == pull_request ]] && [[ "$MINOR" != "$PUSH_MINOR" ]]; then
+            echo "A $EVENT run prioritizes ${PUSH_MINOR}; skipping ${MINOR}"
+          else
+            FTP_INDEX=$(curl -fsSL https://www.python.org/ftp/python/)
+            version=$(echo "$FTP_INDEX" \
+              | grep -oP "${MINOR//./\\.}\.\d+" \
+              | sort -t. -k3 -n \
+              | tail -1 || true)
+            if [[ -z "$version" ]]; then
+              echo "WARNING: No release found for ${MINOR}.x, skipping"
+            elif [[ "$EVENT" == schedule ]] && published "$version"; then
+              echo "Version ${version} is already published, skipping"
+            else
+              build=true
+              echo "Building CPython ${version}"
+            fi
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check out repository
+        if: steps.detect.outputs.build == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # The tags and whether a push is possible. The secret itself is never put in an output or in the environment of this step: only
+      # whether it is set.
+      - name: Work out the tags
+        id: plan
+        if: steps.detect.outputs.build == 'true'
+        env:
+          HAVE_TOKEN: ${{ secrets.GHCR_PUSH_TOKEN != '' }}
+          MINOR: ${{ matrix.minor }}
+          VERSION: ${{ steps.detect.outputs.version }}
+        run: |
+          set -eu
+          case "$GITHUB_REF" in
+            refs/heads/main)
+              tags="$MINOR $VERSION"
+              # Only tag :latest for the highest minor version (3.14)
+              [ "$MINOR" = 3.14 ] && tags="$tags latest" ;;
+            *) tags="" ;;
+          esac
+          dest=""
+          for t in $tags; do dest="$dest --destination=$IMAGE:$t"; done
+          echo "destinations=$dest" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "have_token=$HAVE_TOKEN" >> "$GITHUB_OUTPUT"
+          echo "event: $GITHUB_EVENT_NAME, ref: $GITHUB_REF, building CPython $VERSION"
+          echo "tags to push: ${tags:-none}"
+          if [ -n "$tags" ] && [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "$HAVE_TOKEN" != true ]; then
+            echo "::warning title=Not pushed::GHCR_PUSH_TOKEN is not set for this repository, so the image is built but not pushed."
+          fi
+
+      # Builds with no credential in reach of the Dockerfile's RUN steps. Nothing is pushed; the image goes to a tarball. The base
+      # image (debian) is public. CPython is compiled with PGO and LTO, which takes a long time: no layer cache, one build per run.
+      - name: Build
+        if: steps.detect.outputs.build == 'true'
+        uses: docker://ghcr.io/osscontainertools/kaniko@sha256:2fa20b0a4b40c7db72b479d57e55c2cf79f2178533b2d3bcbd129d6bd3c087ed   # v1.28.6
+        with:
+          args: >-
+            --context=dir://${{ github.workspace }}
+            --dockerfile=Dockerfile
+            --no-push
+            --tar-path=${{ github.workspace }}/.ci-image.tar
+            --destination=${{ env.IMAGE }}:build
+            --build-arg=PYTHON_VERSION=${{ steps.detect.outputs.version }}
+            --label=org.opencontainers.image.title=python-base
+            --label=org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            --label=org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            --label=org.opencontainers.image.version=${{ steps.detect.outputs.version }}
+            --label=org.opencontainers.image.revision=${{ github.sha }}
+            --label=org.opencontainers.image.created=${{ steps.plan.outputs.created }}
+            --label=org.opencontainers.image.licenses=MIT
+
+      # The image config, its size and the libbrotli1 it ships, so a run shows what would be pushed. The registry digest exists only
+      # once the Push step has pushed; the image id below is the config digest, which does not change on the way.
+      - name: Show what was built
+        if: steps.detect.outputs.build == 'true'
+        run: |
+          set -eu
+          ls -l .ci-image.tar
+          cfg="$(tar -xOf .ci-image.tar manifest.json | jq -r '.[0].Config')"
+          echo "image id: $cfg"
+          tar -xOf .ci-image.tar "$cfg" | jq '{architecture, os, user: .config.User, workdir: .config.WorkingDir, entrypoint: .config.Entrypoint, cmd: .config.Cmd, labels: .config.Labels}'
+          tar -tvf .ci-image.tar | awk '/\.tar\.gz$/ { n++; sum += $3 } END { printf "%d layers, %.1f MiB compressed\n", n, sum / 1048576 }'
+
+          # CVE-2026-111497: the libbrotli1 the image ships, from dpkg's database in the image's layers (the last layer that has
+          # the file is the one that counts).
+          status=""
+          for layer in $(tar -xOf .ci-image.tar manifest.json | jq -r '.[0].Layers[]'); do
+            s="$(tar -xOf .ci-image.tar "$layer" | tar -xzO -f - var/lib/dpkg/status ./var/lib/dpkg/status 2>/dev/null || true)"
+            [ -z "$s" ] || status="$s"
+          done
+          have="$(printf '%s\n' "$status" | awk -v RS= -F'\n' '$1 == "Package: libbrotli1" { for (i = 1; i <= NF; i++) if ($i ~ /^Version: /) print substr($i, 10) }')"
+          echo "libbrotli1 in the image: ${have:-not installed}"
+          if [ -n "$have" ] && ! dpkg --compare-versions "$have" ge "$LIBBROTLI_MIN"; then
+            echo "::error title=libbrotli1::$have is older than $LIBBROTLI_MIN (CVE-2026-111497)"
+            exit 1
+          fi
+
+      # The only step that sees the credential, and it runs no build commands. Only for main, never on a pull request. Skipped
+      # while GHCR_PUSH_TOKEN is empty. It writes the registry login inside its own container, not on the workspace volume the
+      # build step shares.
+      - name: Push
+        if: steps.detect.outputs.build == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.plan.outputs.have_token == 'true'
+        uses: docker://ghcr.io/osscontainertools/kaniko@sha256:7ab44d0131c3051b6dea128067e258c7afb5c4815082a93b9cf6c624f2140bf0   # v1.28.6-debug
+        env:
+          GHCR_PUSH_TOKEN: ${{ secrets.GHCR_PUSH_TOKEN }}
+          CONFIG_TEMPLATE: '{"auths":{"ghcr.io":{"auth":"%s"}}}'
+          TAR: ${{ github.workspace }}/.ci-image.tar
+          DEST: ${{ steps.plan.outputs.destinations }}
+        with:
+          entrypoint: /busybox/sh
+          args: >-
+            -c 'umask 077 && mkdir -p /kaniko/.docker
+            && auth="$(printf %s:%s "$GHCR_USER" "$GHCR_PUSH_TOKEN" | /busybox/base64 | /busybox/tr -d "\n")"
+            && printf "$CONFIG_TEMPLATE" "$auth" > /kaniko/.docker/config.json
+            && exec /kaniko/executor push "$TAR" $DEST'
